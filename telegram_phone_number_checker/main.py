@@ -1,16 +1,25 @@
 import asyncio
-import os
 import json
-import re
-from telethon.sync import TelegramClient, errors, functions
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import InputPhoneContact, TypeUserStatus, UserStatusLastWeek, UserStatusEmpty,UserStatusRecently, UserStatusOnline, UserStatusLastMonth, UserStatusOffline
-from dotenv import load_dotenv
-from getpass import getpass
-import click
+from collections.abc import Iterable
 
+import click
+from dotenv import load_dotenv
+from telethon import types
+from telethon.sync import TelegramClient, functions
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import (
+    TypeUserStatus,
+    UserStatusEmpty,
+    UserStatusLastMonth,
+    UserStatusLastWeek,
+    UserStatusOffline,
+    UserStatusOnline,
+    UserStatusRecently,
+)
+from telethon.tl.types.contacts import ImportedContacts
 
 load_dotenv()
+
 
 def get_human_readable_status(status: TypeUserStatus):
     match status:
@@ -32,9 +41,12 @@ def get_human_readable_status(status: TypeUserStatus):
 
 async def get_user_info(client: TelegramClient, phone_number: str) -> dict:
     """Take in a phone number and returns the associated user information if the user exists."""
-    result = {}
     print(f"Checking: {phone_number=} ...", end="", flush=True)
-    peer_id = await client.get_peer_id(phone_number)
+    try:
+        peer_id = await client.get_peer_id(phone_number)
+    except ValueError:
+        print(f"Could not find a Telegram account associated with {phone_number=}")
+        return {}
     user = (await client(GetFullUserRequest(peer_id))).users[0]
     return {
         "id": peer_id,
@@ -52,6 +64,43 @@ async def get_user_info(client: TelegramClient, phone_number: str) -> dict:
         "restriction_reason": user.restriction_reason,
         "user_was_online": get_human_readable_status(user.status),
         "deleted": user.deleted,
+        "phone": user.phone,
+    }
+
+
+async def _is_phone_number_a_contact(client, phone_number: str) -> bool:
+    normalized_target_number = phone_number.replace("+", "").replace(" ", "")
+    contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+    for contact in contacts.users:
+        normalized_contact_number = (
+            contact.phone.replace(" ", "") if contact.phone else None
+        )
+        if normalized_target_number == normalized_contact_number:
+            return True
+    return False
+
+
+async def _create_temp_contacts(
+    client: TelegramClient, numbers: Iterable[str]
+) -> ImportedContacts:
+    print(f"Temporarily adding {", ".join(numbers)} to contact list.")
+    temp_contacts = [
+        types.InputPhoneContact(client_id=0, phone=number, first_name="", last_name="")
+        for number in numbers
+    ]
+    just_added_contacts: ImportedContacts = await client(
+        functions.contacts.ImportContactsRequest(temp_contacts)
+    )
+    just_added_numbers = [user.phone for user in just_added_contacts.users]
+    print(f"Successfully added {", ".join(just_added_numbers)} to contact list.")
+    return just_added_contacts
+
+
+async def _get_numbers_not_in_contacts(client: TelegramClient, numbers: Iterable[str]):
+    return {
+        number
+        for number in numbers
+        if not await _is_phone_number_a_contact(client, number)
     }
 
 
@@ -61,8 +110,23 @@ async def validate_users(client: TelegramClient, phone_numbers: str) -> dict:
     """
     if not phone_numbers or not len(phone_numbers):
         phone_numbers = input("Enter the phone numbers to check, separated by commas: ")
-    phones = {re.sub(r"\s+", "", p, flags=re.UNICODE) for p in phone_numbers.split(",")}
-    return {phone: await get_user_info(client, phone) for phone in phones}
+    cleaned_numbers: set[str] = set(phone_numbers.replace(" ", "").split(","))
+    numbers_not_in_contacts = await _get_numbers_not_in_contacts(
+        client, cleaned_numbers
+    )
+    temp_contacts = None
+    if numbers_not_in_contacts:
+        temp_contacts = await _create_temp_contacts(client, numbers_not_in_contacts)
+    try:
+        return {phone: await get_user_info(client, phone) for phone in cleaned_numbers}
+    finally:
+        if temp_contacts:
+            print(f"Removing users temporarily added to contact list.")
+            to_delete = [
+                types.InputUser(user_id=user.id, access_hash=user.access_hash)
+                for user in temp_contacts.users
+            ]
+            await client(functions.contacts.DeleteContactsRequest(to_delete))
 
 
 def show_results(output: str, res: dict) -> None:
@@ -123,7 +187,12 @@ def show_results(output: str, res: dict) -> None:
     type=str,
 )
 def main_entrypoint(
-    phone_numbers: str, api_id: int, api_hash: str, api_phone_number: str, api_phone_password: str, output: str
+    phone_numbers: str,
+    api_id: int,
+    api_hash: str,
+    api_phone_number: str,
+    api_phone_password: str,
+    output: str,
 ) -> None:
     """
     Check to see if one or more phone numbers belong to a valid Telegram account.
@@ -157,11 +226,24 @@ def main_entrypoint(
     i.e. +491234567891
 
     """
-    asyncio.run(run_program(api_phone_number, api_phone_password, api_id, api_hash, phone_numbers, output))
+    asyncio.run(
+        run_program(
+            api_phone_number,
+            api_phone_password,
+            api_id,
+            api_hash,
+            phone_numbers,
+            output,
+        )
+    )
 
 
-async def run_program(api_phone_number, api_phone_password, api_id, api_hash, phone_numbers, output):
-    async with TelegramClient(api_phone_number, api_id, api_hash) as client:
+async def run_program(
+    api_phone_number, api_phone_password, api_id, api_hash, phone_numbers, output
+):
+    async with TelegramClient(
+        "Telegram Phone Number Checker", api_id, api_hash
+    ) as client:
         await client.start(phone=api_phone_number, password=api_phone_password)
         res = await validate_users(client, phone_numbers)
         show_results(output, res)
